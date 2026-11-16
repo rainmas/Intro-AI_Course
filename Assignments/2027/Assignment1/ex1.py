@@ -1,6 +1,7 @@
 import ex1_check
 import search
 import utils
+import heapq
 
 id = ["No numbers - I'm special!"]
 
@@ -12,7 +13,7 @@ class State:
             if isinstance(value, dict):
                 return tuple(value.items())
             return tuple(value)
-        
+
         self.truck_positions = self.to_tuple(truck_positions)
         self.ferry_positions = self.to_tuple(ferry_positions)
         self.package_positions = self.to_tuple(package_positions)
@@ -47,7 +48,7 @@ class LogisticsProblem(search.Problem):
 
         """ Constructor only needs the initial state.
         Don't forget to set the goal or implement the goal test"""
-        self.locations = initial["Locations"]
+        self.location_count = initial["Locations"]
         self.roads = initial["Roads"]
         self.ports = initial["Ports"]
 
@@ -85,7 +86,56 @@ class LogisticsProblem(search.Problem):
             self.package_destinations[package] = packages[package][2]
 
         state = State(truck_positions, ferry_positions, package_positions, truck_weights, ferry_truck_counts)
+        self.precompute_destination_distances()
+
         search.Problem.__init__(self, state)
+
+    def construct_heuristic_graph(self):
+        graph = {}
+        for location in self.location_neighbors:
+            graph[(location, False)] = [(neighbor, False) for neighbor in self.location_neighbors[location]]
+
+        for ferry in self.ferry_ports:
+            served_ports = self.ferry_ports[ferry]
+            for port in served_ports:
+                graph[(port, True, ferry)] = [(neighbor, True, ferry) for neighbor in served_ports if neighbor != port]
+                graph[(port, True, ferry)].append((port, False))
+                graph.setdefault((port, False), [])
+                graph[(port, False)].append((port, True, ferry))
+        return graph
+
+    def dijkstra_on_heuristic_graph(self, graph, start):
+        distances = {start: 0}
+        heap = [(0, start)]
+
+        while heap:
+            current_distance, current_vertex = heapq.heappop(heap)
+
+            if current_distance > distances[current_vertex]:
+                continue
+
+            for neighbor in graph[current_vertex]:
+                if current_vertex[1] and neighbor[1]:
+                    edge_cost = 3
+                else:
+                    edge_cost = 1
+
+                new_distance = current_distance + edge_cost
+
+                if new_distance < distances.get(neighbor, float('inf')):
+                    distances[neighbor] = new_distance
+                    heapq.heappush(heap, (new_distance, neighbor))
+
+        return distances
+
+    def precompute_destination_distances(self):
+        graph = self.construct_heuristic_graph()
+        self.distances = {}
+        for destination in set(self.package_destinations.values()):
+            self.distances[destination] = self.dijkstra_on_heuristic_graph(
+                graph, (destination, False)
+            )
+
 
     def path_cost(self, c, state1, action, state2):
         """ Do not change this. Returns the cost of reaching state2 from state1 via action,
@@ -161,7 +211,7 @@ class LogisticsProblem(search.Problem):
                     truck_weights[tid] += self.package_weights[pid]
 
         return successors
-    
+
 
     def sail_successors(self, state):
         ferry_positions = dict(state.ferry_positions)
@@ -178,9 +228,9 @@ class LogisticsProblem(search.Problem):
                     new_state
                 ))
                 ferry_positions[id] = pos
-        
+
         return successors
-    
+
 
     def board_disembark_successors(self, state):
         truck_positions = dict(state.truck_positions)
@@ -216,7 +266,7 @@ class LogisticsProblem(search.Problem):
 
         return successors
 
-    
+
     def goal_test(self, state):
         """ given a state, checks if this is the goal state, compares to the created goal state returns True/False"""
         package_positions = state.package_positions
@@ -230,9 +280,44 @@ class LogisticsProblem(search.Problem):
         """ This is the heuristic. It gets a node (not a state)
         and returns a goal distance estimate"""
 
-        # Placeholder for actual heuristic
-        return 0
+        state = node.state
+        return self.calculate_handeling_costs(state) + self.max_min_travel_distance(state)
 
+
+    def calculate_handeling_costs(self, state):
+        package_positions = state.package_positions
+        handeling_costs = 0
+        for id, pos in package_positions:
+            if pos[0] != "ground":
+                handeling_costs += 1:
+            elif pos[1] != self.package_destinations[id]:
+                handeling_costs += 2
+        return handeling_costs
+
+    def max_min_travel_distance(self, state):
+        max_travel_distance = 0
+        package_positions = state.package_positions
+        truck_positions = dict(state.truck_positions)
+        ferry_positions = dict(state.ferry_positions)
+        for id, pos in package_positions:
+            if pos[0] == "ground":
+                location = pos[1]
+                dist = self.distances[self.package_destinations[id]][(location, False)]
+            elif pos[0] == "truck":
+                tid = pos[1]
+                tpos = truck_positions[tid]
+                if tpos[0] == "land":
+                    location = tpos[1]
+                    dist = self.distances[self.package_destinations[id]][(location, False)]
+                elif tpos[0] == "ferry":
+                    fid = tpos[1]
+                    fpos = ferry_positions[fid]
+                    dist = self.distances[self.package_destinations[id]][(fpos, True, fid)]
+
+            if dist > max_travel_distance:
+                max_travel_distance = dist
+
+        return max_travel_distance
 
 def create_logistics_problem(game):
     print("<<create_logistics_problem")
