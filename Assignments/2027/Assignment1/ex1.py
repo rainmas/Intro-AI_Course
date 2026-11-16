@@ -289,7 +289,7 @@ class LogisticsProblem(search.Problem):
         handeling_costs = 0
         for id, pos in package_positions:
             if pos[0] != "ground":
-                handeling_costs += 1:
+                handeling_costs += 1
             elif pos[1] != self.package_destinations[id]:
                 handeling_costs += 2
         return handeling_costs
