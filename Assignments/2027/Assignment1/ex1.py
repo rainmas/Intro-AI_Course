@@ -14,11 +14,11 @@ class State:
                 return tuple(value.items())
             return tuple(value)
 
-        self.truck_positions = self.to_tuple(truck_positions)
-        self.ferry_positions = self.to_tuple(ferry_positions)
-        self.package_positions = self.to_tuple(package_positions)
-        self.truck_weights = self.to_tuple(truck_weights)
-        self.ferry_truck_counts = self.to_tuple(ferry_truck_counts)
+        self.truck_positions = to_tuple(truck_positions)
+        self.ferry_positions = to_tuple(ferry_positions)
+        self.package_positions = to_tuple(package_positions)
+        self.truck_weights = to_tuple(truck_weights)
+        self.ferry_truck_counts = to_tuple(ferry_truck_counts)
 
 
     def __eq__(self, other):
@@ -87,8 +87,45 @@ class LogisticsProblem(search.Problem):
 
         state = State(truck_positions, ferry_positions, package_positions, truck_weights, ferry_truck_counts)
         self.precompute_destination_distances()
+        self.calculate_package_transportation_constant()
 
         search.Problem.__init__(self, state)
+
+    def calculate_package_transportation_constant(self):
+        # Calculates max amount of possible packages that are transported in a single action
+        sorted_weights = sorted(self.package_weights.values())
+        if len(self.ferry_capacities) > 0:
+            sorted_truck_capacities = sorted(
+                self.truck_capacities.values(), reverse=True
+            )
+            max_ferry_capacity = max(self.ferry_capacities.values())
+            max_total_capacity = 0
+            for i, capacity in enumerate(sorted_truck_capacities):
+                if i == max_ferry_capacity:
+                    break
+                max_total_capacity += capacity
+
+            ferry_count = 0
+            total_weight = 0
+            for weight in sorted_weights:
+                if total_weight + weight > max_total_capacity:
+                    break
+                ferry_count += 1
+                total_weight += weight
+
+        else:
+            ferry_count = 0
+
+        max_truck_capacity = max(self.truck_capacities.values())
+        truck_count = 0
+        total_weight = 0
+        for weight in sorted_weights:
+            if total_weight + weight > max_truck_capacity:
+                break
+            truck_count += 1
+            total_weight += weight
+
+        self.package_transportation_constant = max(3 * truck_count, ferry_count)
 
     def construct_heuristic_graph(self):
         graph = {}
@@ -131,9 +168,9 @@ class LogisticsProblem(search.Problem):
     def precompute_destination_distances(self):
         graph = self.construct_heuristic_graph()
         self.distances = {}
-        for destination in set(self.package_destinations.values()):
-            self.distances[destination] = self.dijkstra_on_heuristic_graph(
-                graph, (destination, False)
+        for i in range(self.location_count):
+            self.distances[i] = self.dijkstra_on_heuristic_graph(
+                graph, (i, False)
             )
 
 
@@ -146,7 +183,10 @@ class LogisticsProblem(search.Problem):
         """ Generates the successor states returns [(action, achieved_states, ...)]"""
         successors = []
         successors.extend(self.drive_successors(state))
-        successors.extend(self.load_unload_successors(state))
+        forcedUnload, actions = self.load_unload_successors(state)
+        if forcedUnload:
+            return actions
+        successors.extend(actions)
         successors.extend(self.sail_successors(state))
         successors.extend(self.board_disembark_successors(state))
         return successors
@@ -203,14 +243,17 @@ class LogisticsProblem(search.Problem):
                     package_positions[pid] = ("ground", tpos[1])
                     truck_weights[tid] -= self.package_weights[pid]
                     new_state = State(truck_positions, state.ferry_positions, package_positions, truck_weights, state.ferry_truck_counts)
-                    successors.append((
+                    action = (
                         f"UNLOAD{{{pid},{tid}}}",
                         new_state
-                    ))
+                    )
+                    if self.package_destinations[pid] == tpos[1]:
+                        return True, [action]
+                    successors.append(action)
                     package_positions[pid] = ppos
                     truck_weights[tid] += self.package_weights[pid]
 
-        return successors
+        return False, successors
 
 
     def sail_successors(self, state):
@@ -281,9 +324,30 @@ class LogisticsProblem(search.Problem):
         and returns a goal distance estimate"""
 
         state = node.state
-        return self.calculate_handeling_costs(state) + self.max_min_travel_distance(state)
+        return self.calculate_handeling_costs(state) + max(self.max_min_travel_distance(state), self.average_reduction_heuristic(state))
 
-
+    def average_reduction_heuristic(self, state):
+        total_distances = 0
+        package_positions = state.package_positions
+        truck_positions = dict(state.truck_positions)
+        ferry_positions = dict(state.ferry_positions)
+        for id, pos in package_positions:
+            destination = self.package_destinations[id]
+            if pos[0] == "ground":
+                total_distances += self.distances[destination][(pos[1], False)]
+            elif pos[0] == "truck":
+                tid = pos[1]
+                tpos = truck_positions[tid]
+                if tpos[0] == "land":
+                    total_distances += self.distances[destination][(tpos[1], False)]
+                elif tpos[0] == "ferry":
+                    fid = tpos[1]
+                    fpos = ferry_positions[fid]
+                    total_distances += self.distances[destination][(fpos, True, fid)]
+        return (
+            3 * total_distances
+            + self.package_transportation_constant - 1
+        ) // self.package_transportation_constant
     def calculate_handeling_costs(self, state):
         package_positions = state.package_positions
         handeling_costs = 0
@@ -301,8 +365,25 @@ class LogisticsProblem(search.Problem):
         ferry_positions = dict(state.ferry_positions)
         for id, pos in package_positions:
             if pos[0] == "ground":
+                if pos[1] == self.package_destinations[id]:
+                    continue
                 location = pos[1]
                 dist = self.distances[self.package_destinations[id]][(location, False)]
+                min_truck_dist = float("inf")
+
+                for tid in truck_positions:
+                    if self.truck_capacities[tid] >= self.package_weights[id]:
+                        tpos = truck_positions[tid]
+                        if tpos[0] == "land":
+                            truck_dist = self.distances[location][(tpos[1], False)]
+                        elif tpos[0] == "ferry":
+                            fid = tpos[1]
+                            fpos = ferry_positions[fid]
+                            truck_dist = self.distances[location][(fpos, True, fid)]
+                        min_truck_dist = min(min_truck_dist, truck_dist)
+
+                dist += min_truck_dist
+
             elif pos[0] == "truck":
                 tid = pos[1]
                 tpos = truck_positions[tid]
@@ -314,8 +395,7 @@ class LogisticsProblem(search.Problem):
                     fpos = ferry_positions[fid]
                     dist = self.distances[self.package_destinations[id]][(fpos, True, fid)]
 
-            if dist > max_travel_distance:
-                max_travel_distance = dist
+            max_travel_distance = max(max_travel_distance, dist)
 
         return max_travel_distance
 
