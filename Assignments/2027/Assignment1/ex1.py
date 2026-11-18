@@ -123,6 +123,8 @@ class LogisticsProblem(search.Problem):
             truck_count += 1
             total_weight += weight
 
+        self.max_ferry_packages = ferry_count
+        self.max_truck_packages = truck_count
         self.package_transportation_constant = max(3 * truck_count, ferry_count)
 
     def construct_heuristic_graph(self):
@@ -139,7 +141,7 @@ class LogisticsProblem(search.Problem):
                 graph[(port, False)].append((port, True, ferry))
         return graph
 
-    def dijkstra_on_heuristic_graph(self, graph, start):
+    def dijkstra_on_heuristic_graph(self, graph, start, road_cost=1, ferry_cost=3):
         distances = {start: 0}
         heap = [(0, start)]
 
@@ -151,9 +153,9 @@ class LogisticsProblem(search.Problem):
 
             for neighbor in graph[current_vertex]:
                 if current_vertex[1] and neighbor[1]:
-                    edge_cost = 3
+                    edge_cost = ferry_cost
                 else:
-                    edge_cost = 1
+                    edge_cost = road_cost
 
                 new_distance = current_distance + edge_cost
 
@@ -169,6 +171,24 @@ class LogisticsProblem(search.Problem):
         for i in range(self.location_count):
             self.distances[i] = self.dijkstra_on_heuristic_graph(
                 graph, (i, False)
+            )
+
+        self.onecost_distances = {}
+        for i in range(self.location_count):
+            self.onecost_distances[i] = self.dijkstra_on_heuristic_graph(
+                graph, (i, False), road_cost=1, ferry_cost=1
+            )
+
+        self.min_truck_distances = {}
+        for i in range(self.location_count):
+            self.min_truck_distances[i] = self.dijkstra_on_heuristic_graph(
+                graph, (i, False), road_cost=1, ferry_cost=0
+            )
+
+        self.min_ferry_distances = {}
+        for i in range(self.location_count):
+            self.min_ferry_distances[i] = self.dijkstra_on_heuristic_graph(
+                graph, (i, False), road_cost=0, ferry_cost=3
             )
 
 
@@ -322,7 +342,40 @@ class LogisticsProblem(search.Problem):
         and returns a goal distance estimate"""
 
         state = node.state
-        return self.calculate_handeling_costs(state) + max(self.max_min_travel_distance(state), self.average_reduction_heuristic(state))
+        return self.calculate_handeling_costs(state) + max(self.max_min_travel_distance(state),
+                                                           self.average_reduction_heuristic(state),
+                                                           self.combined_truck_ferry_distances_heuristc(state))
+
+    def combined_truck_ferry_distances_heuristc(self, state):
+        total_truck_distances = 0
+        total_ferry_distances = 0
+        package_positions = state.package_positions
+        truck_positions = dict(state.truck_positions)
+        ferry_positions = dict(state.ferry_positions)
+        for id, pos in package_positions:
+            destination = self.package_destinations[id]
+            if pos[0] == "ground":
+                total_truck_distances += self.min_truck_distances[destination][(pos[1], False)]
+                total_ferry_distances += self.min_ferry_distances[destination][(pos[1], False)]
+            elif pos[0] == "truck":
+                tid = pos[1]
+                tpos = truck_positions[tid]
+                if tpos[0] == "land":
+                    total_truck_distances += self.min_truck_distances[destination][(tpos[1], False)]
+                    total_ferry_distances += self.min_ferry_distances[destination][(tpos[1], False)]
+                elif tpos[0] == "ferry":
+                    fid = tpos[1]
+                    fpos = ferry_positions[fid]
+                    total_truck_distances += self.min_truck_distances[destination][(fpos, False)]
+                    total_ferry_distances += self.min_ferry_distances[destination][(fpos, False)]
+
+        min_truck_cost = (total_truck_distances + self.max_truck_packages - 1) // self.max_truck_packages
+        if total_ferry_distances == 0:
+            min_ferry_cost = 0
+        else:
+            min_ferry_cost = (total_ferry_distances + self.max_ferry_packages - 1) // self.max_ferry_packages
+        return min_truck_cost + min_ferry_cost
+
 
     def average_reduction_heuristic(self, state):
         total_distances = 0
@@ -332,20 +385,21 @@ class LogisticsProblem(search.Problem):
         for id, pos in package_positions:
             destination = self.package_destinations[id]
             if pos[0] == "ground":
-                total_distances += self.distances[destination][(pos[1], False)]
+                total_distances += self.onecost_distances[destination][(pos[1], False)]
             elif pos[0] == "truck":
                 tid = pos[1]
                 tpos = truck_positions[tid]
                 if tpos[0] == "land":
-                    total_distances += self.distances[destination][(tpos[1], False)]
+                    total_distances += self.onecost_distances[destination][(tpos[1], False)]
                 elif tpos[0] == "ferry":
                     fid = tpos[1]
                     fpos = ferry_positions[fid]
-                    total_distances += self.distances[destination][(fpos, True, fid)]
+                    total_distances += self.onecost_distances[destination][(fpos, True, fid)]
         return (
             3 * total_distances
             + self.package_transportation_constant - 1
         ) // self.package_transportation_constant
+
     def calculate_handeling_costs(self, state):
         package_positions = state.package_positions
         handeling_costs = 0
