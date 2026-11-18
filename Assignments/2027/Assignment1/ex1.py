@@ -28,8 +28,7 @@ class State:
         return (
             self.truck_positions == other.truck_positions and
             self.ferry_positions == other.ferry_positions and
-            self.package_positions == other.package_positions and
-            self.truck_weights == other.truck_weights
+            self.package_positions == other.package_positions
         )
 
     def __hash__(self):
@@ -37,7 +36,6 @@ class State:
             self.truck_positions,
             self.ferry_positions,
             self.package_positions,
-            self.truck_weights
         ))
 
 class LogisticsProblem(search.Problem):
