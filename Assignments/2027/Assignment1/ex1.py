@@ -6,9 +6,15 @@ import heapq
 id = ["No numbers - I'm special!"]
 
 class State:
+    __slots__ = (
+        "truck_positions",
+        "ferry_positions",
+        "package_positions",
+        "truck_weights",
+        "ferry_truck_counts",
+    )
     def __init__(self, truck_positions, ferry_positions,
                  package_positions, truck_weights, ferry_truck_counts):
-
         def to_tuple(value):
             if isinstance(value, dict):
                 return tuple(value.items())
@@ -356,9 +362,9 @@ class LogisticsProblem(search.Problem):
         state = node.state
         return self.calculate_handeling_costs(state) + max(self.max_min_travel_distance(state),
                                                            self.average_reduction_heuristic(state),
-                                                           self.combined_truck_ferry_distances_heuristc(state))
+                                                           self.combined_truck_ferry_distances_heuristic(state))
 
-    def combined_truck_ferry_distances_heuristc(self, state):
+    def combined_truck_ferry_distances_heuristic(self, state):
         total_truck_distances = 0
         total_ferry_distances = 0
         package_positions = state.package_positions
@@ -382,10 +388,13 @@ class LogisticsProblem(search.Problem):
                     total_ferry_distances += self.min_ferry_distances[destination][(fpos, False)]
 
         min_truck_cost = (total_truck_distances + self.max_truck_packages - 1) // self.max_truck_packages
-        if total_ferry_distances == 0:
-            min_ferry_cost = 0
+
+        ferry_edges = total_ferry_distances // 3
+        if ferry_edges == 0 or self.max_ferry_packages == 0:
+            min_ferry_cost = 0 if ferry_edges == 0 else float("inf")
         else:
-            min_ferry_cost = (total_ferry_distances + self.max_ferry_packages - 1) // self.max_ferry_packages
+            min_ferry_cost = 3 * ((ferry_edges + self.max_ferry_packages - 1)
+                                // self.max_ferry_packages)
         return min_truck_cost + min_ferry_cost
 
 
