@@ -129,6 +129,9 @@ class LogisticsProblem(search.Problem):
 
     def construct_heuristic_graph(self):
         graph = {}
+        for i in range(self.location_count):
+            graph.setdefault((i, False), [])
+
         for location in self.location_neighbors:
             graph[(location, False)] = [(neighbor, False) for neighbor in self.location_neighbors[location]]
 
@@ -276,11 +279,20 @@ class LogisticsProblem(search.Problem):
 
     def sail_successors(self, state):
         ferry_positions = dict(state.ferry_positions)
+        ferry_truck_counts = dict(state.ferry_truck_counts)
+        truck_positions = state.truck_positions
         successors = []
+        ports_with_trucks = set()
+        for tid, tpos in truck_positions:
+            if tpos[0] == "land" and tpos[1] in self.ports:
+                ports_with_trucks.add(tpos[1])
         for id in ferry_positions:
             pos = ferry_positions[id]
+            no_trucks = ferry_truck_counts[id] == 0
             for port in self.ferry_ports[id]:
                 if port == pos:
+                    continue
+                if no_trucks and port not in ports_with_trucks:
                     continue
                 ferry_positions[id] = port
                 new_state = State(state.truck_positions, ferry_positions, state.package_positions, state.truck_weights, state.ferry_truck_counts)
