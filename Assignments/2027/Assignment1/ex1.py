@@ -4,8 +4,9 @@ import utils
 import heapq
 
 id = ["No numbers - I'm special!"]
+INF = 10**12
 
-class State:
+class ComponentState:
     __slots__ = (
         "truck_positions",
         "ferry_positions",
@@ -28,7 +29,7 @@ class State:
 
 
     def __eq__(self, other):
-        if not isinstance(other, State):
+        if not isinstance(other, ComponentState):
             return NotImplemented
 
         return (
@@ -44,61 +45,103 @@ class State:
             self.package_positions,
         ))
 
-class LogisticsProblem(search.Problem):
-    """This class implements a logistics problem"""
+class State:
+    __slots__ = ("components",)
+    def __init__(self, components):
+        self.components = tuple(components)
+    def __eq__(self, other):
+        if not isinstance(other, State):
+            return NotImplemented
+        return self.components == other.components
+    def __hash__(self):
+        return hash(self.components)
 
-    def __init__(self, initial):
+
+class ComponentSolver():
+    def __init__(self, idx, locs, trucks, ferries, packages,
+                 roads, ports):
 
 
-        """ Constructor only needs the initial state.
-        Don't forget to set the goal or implement the goal test"""
-        self.location_count = initial["Locations"]
-        self.roads = initial["Roads"]
-        self.ports = initial["Ports"]
+        # ---------- 1. store sliced domain data ----------
+        self.idx = idx
+        self.locs = frozenset(locs)
+        self.ports = frozenset(ports)
+        self.trucks = trucks            # {tid: (loc, cap)}
+        self.ferries = ferries          # {fid: (loc, ports, cap)}
+        self.packages = packages        # {pid: (start, w, dest)}
 
-        self.location_neighbors = {}
-        for road in self.roads:
-            self.location_neighbors.setdefault(road[0], []).append(road[1])
-            self.location_neighbors.setdefault(road[1], []).append(road[0])
+        self.truck_capacities = {t: v[1] for t, v in trucks.items()}
+        self.ferry_capacities = {f: v[2] for f, v in ferries.items()}
+        self.ferry_ports      = {f: frozenset(v[1]) for f, v in ferries.items()}
+        self.package_weights      = {p: v[1] for p, v in packages.items()}
+        self.package_destinations = {p: v[2] for p, v in packages.items()}
 
-        trucks = initial["Trucks"]
-        self.truck_capacities = {}
-        truck_positions = {}
-        truck_weights = {}
-        for truck in trucks:
-            truck_positions[truck] = ("land", trucks[truck][0])
-            self.truck_capacities[truck] = trucks[truck][1]
-            truck_weights[truck] = 0
+        # ---------- 2. road graph scoped to this component ----------
+        # Union-find guarantees both endpoints of a road are in the same
+        # component, so filtering by `a in locs` is enough.
+        self.location_neighbors = {l: [] for l in self.locs}
+        for a, b in roads:
+            if a in self.locs:          # equivalently b in self.locs
+                self.location_neighbors[a].append(b)
+                self.location_neighbors[b].append(a)
 
-        self.ferry_capacities = {}
-        self.ferry_ports = {}
-        ferry_positions = {}
-        ferry_truck_counts = {}
-        for ferry in initial["Ferries"]:
-            ferry_positions[ferry] = initial["Ferries"][ferry][0]
-            self.ferry_capacities[ferry] = initial["Ferries"][ferry][2]
-            self.ferry_ports[ferry] = initial["Ferries"][ferry][1]
-            ferry_truck_counts[ferry] = 0
+        # ---------- 3. heuristic graph (roads + ferry-port cliques) ----------
+        graph = self._build_heuristic_graph()
 
-        packages = initial["Packages"]
-        self.package_weights = {}
-        self.package_destinations = {}
-        package_positions = {}
-        for package in packages:
-            package_positions[package] = ("ground", packages[package][0])
-            self.package_weights[package] = packages[package][1]
-            self.package_destinations[package] = packages[package][2]
+        # ---------- 4. Dijkstra tables (dense over this component) ----------
+        self.distances          = {}
+        self.onecost_distances  = {}
+        self.min_truck_distances = {}
+        self.min_ferry_distances = {}
+        for l in self.locs:
+            self.distances[l]           = self._dijkstra(graph, (l, False),
+                                                         road_cost=1, ferry_cost=3)
+            self.onecost_distances[l]   = self._dijkstra(graph, (l, False),
+                                                         road_cost=1, ferry_cost=1)
+            self.min_truck_distances[l] = self._dijkstra(graph, (l, False),
+                                                         road_cost=1, ferry_cost=0)
+            self.min_ferry_distances[l] = self._dijkstra(graph, (l, False),
+                                                         road_cost=0, ferry_cost=3)
 
-        state = State(truck_positions, ferry_positions, package_positions, truck_weights, ferry_truck_counts)
-        self.precompute_destination_distances()
-        self.calculate_package_transportation_constant()
+        # ---------- 5. per-component transportation constants ----------
+        self._compute_transportation_constants()
 
-        search.Problem.__init__(self, state)
+        # ---------- 6. precomputed capable-truck lists ----------
+        self.capable_trucks = {
+            pid: [tid for tid, cap in self.truck_capacities.items()
+                  if cap >= self.package_weights[pid]]
+            for pid in self.packages
+        }
 
-    def calculate_package_transportation_constant(self):
+        # ---------- 7. initial ComponentState ----------
+        # Deterministic order: preserve insertion order from the sliced dicts.
+        truck_positions = tuple(
+            (tid, ("land", trucks[tid][0])) for tid in trucks
+        )
+        ferry_positions = tuple(
+            (fid, ferries[fid][0]) for fid in ferries
+        )
+        package_positions = tuple(
+            (pid, ("ground", packages[pid][0])) for pid in packages
+        )
+        truck_weights = tuple(
+            (tid, 0) for tid in trucks
+        )
+        ferry_truck_counts = tuple(
+            (fid, 0) for fid in ferries
+        )
+        self.initial_component_state = ComponentState(
+            truck_positions, ferry_positions, package_positions, truck_weights, ferry_truck_counts
+        )
+
+        # ---------- 8. frozen initial h ----------
+        # MUST be computed after steps 4 and 5, from the *initial* state.
+        self.initial_h = self.h(self.initial_component_state)
+
+    def _compute_transportation_constants(self):
         # Calculates max amount of possible packages that are transported in a single action
         sorted_weights = sorted(self.package_weights.values())
-        if len(self.ferry_capacities) > 0:
+        if self.ferry_capacities:
             sorted_truck_capacities = sorted(
                 self.truck_capacities.values(), reverse=True
             )
@@ -120,24 +163,24 @@ class LogisticsProblem(search.Problem):
         else:
             ferry_count = 0
 
-        max_truck_capacity = max(self.truck_capacities.values())
-        truck_count = 0
-        total_weight = 0
-        for weight in sorted_weights:
-            if total_weight + weight > max_truck_capacity:
-                break
-            truck_count += 1
-            total_weight += weight
+        if self.truck_capacities:
+            max_truck_capacity = max(self.truck_capacities.values())
+            truck_count = 0
+            total_weight = 0
+            for weight in sorted_weights:
+                if total_weight + weight > max_truck_capacity:
+                    break
+                truck_count += 1
+                total_weight += weight
+        else:
+            truck_count = 0
 
         self.max_ferry_packages = ferry_count
         self.max_truck_packages = truck_count
         self.package_transportation_constant = max(3 * truck_count, ferry_count)
 
-    def construct_heuristic_graph(self):
+    def _build_heuristic_graph(self):
         graph = {}
-        for i in range(self.location_count):
-            graph.setdefault((i, False), [])
-
         for location in self.location_neighbors:
             graph[(location, False)] = [(neighbor, False) for neighbor in self.location_neighbors[location]]
 
@@ -150,7 +193,7 @@ class LogisticsProblem(search.Problem):
                 graph[(port, False)].append((port, True, ferry))
         return graph
 
-    def dijkstra_on_heuristic_graph(self, graph, start, road_cost=1, ferry_cost=3):
+    def _dijkstra(self, graph, start, road_cost=1, ferry_cost=3):
         distances = {start: 0}
         heap = [(0, start)]
 
@@ -173,38 +216,6 @@ class LogisticsProblem(search.Problem):
                     heapq.heappush(heap, (new_distance, neighbor))
 
         return distances
-
-    def precompute_destination_distances(self):
-        graph = self.construct_heuristic_graph()
-        self.distances = {}
-        for i in range(self.location_count):
-            self.distances[i] = self.dijkstra_on_heuristic_graph(
-                graph, (i, False)
-            )
-
-        self.onecost_distances = {}
-        for i in range(self.location_count):
-            self.onecost_distances[i] = self.dijkstra_on_heuristic_graph(
-                graph, (i, False), road_cost=1, ferry_cost=1
-            )
-
-        self.min_truck_distances = {}
-        for i in range(self.location_count):
-            self.min_truck_distances[i] = self.dijkstra_on_heuristic_graph(
-                graph, (i, False), road_cost=1, ferry_cost=0
-            )
-
-        self.min_ferry_distances = {}
-        for i in range(self.location_count):
-            self.min_ferry_distances[i] = self.dijkstra_on_heuristic_graph(
-                graph, (i, False), road_cost=0, ferry_cost=3
-            )
-
-
-    def path_cost(self, c, state1, action, state2):
-        """ Do not change this. Returns the cost of reaching state2 from state1 via action,
-        given cost c to reach state1: SAIL costs 3, every other action costs 1"""
-        return c + (3 if action.startswith("SAIL") else 1)
 
     def successor(self, state):
         """ Generates the successor states returns [(action, achieved_states, ...)]"""
@@ -230,7 +241,7 @@ class LogisticsProblem(search.Problem):
             location = pos[1]
             for neighbor in self.location_neighbors[location]:
                 truck_positions[id] = ("land", neighbor)
-                new_state = State(truck_positions, state.ferry_positions, state.package_positions, state.truck_weights, state.ferry_truck_counts)
+                new_state = ComponentState(truck_positions, state.ferry_positions, state.package_positions, state.truck_weights, state.ferry_truck_counts)
                 successors.append((
                     f"DRIVE{{{id},{location},{neighbor}}}",
                     new_state
@@ -256,7 +267,7 @@ class LogisticsProblem(search.Problem):
                     self.truck_capacities[tid] >= self.package_weights[pid] + truck_weights[tid]):
                         package_positions[pid] = ("truck", tid)
                         truck_weights[tid] += self.package_weights[pid]
-                        new_state = State(truck_positions, state.ferry_positions, package_positions, truck_weights, state.ferry_truck_counts)
+                        new_state = ComponentState(truck_positions, state.ferry_positions, package_positions, truck_weights, state.ferry_truck_counts)
                         successors.append((
                             f"LOAD{{{pid},{tid}}}",
                             new_state
@@ -269,7 +280,7 @@ class LogisticsProblem(search.Problem):
                 if tpos[0] == "land":
                     package_positions[pid] = ("ground", tpos[1])
                     truck_weights[tid] -= self.package_weights[pid]
-                    new_state = State(truck_positions, state.ferry_positions, package_positions, truck_weights, state.ferry_truck_counts)
+                    new_state = ComponentState(truck_positions, state.ferry_positions, package_positions, truck_weights, state.ferry_truck_counts)
                     action = (
                         f"UNLOAD{{{pid},{tid}}}",
                         new_state
@@ -301,7 +312,7 @@ class LogisticsProblem(search.Problem):
                 if no_trucks and port not in ports_with_trucks:
                     continue
                 ferry_positions[id] = port
-                new_state = State(state.truck_positions, ferry_positions, state.package_positions, state.truck_weights, state.ferry_truck_counts)
+                new_state = ComponentState(state.truck_positions, ferry_positions, state.package_positions, state.truck_weights, state.ferry_truck_counts)
                 successors.append((
                     f"SAIL{{{id},{pos},{port}}}",
                     new_state
@@ -325,7 +336,7 @@ class LogisticsProblem(search.Problem):
                 ferry_truck_counts[fid] + 1 <= self.ferry_capacities[fid]):
                     ferry_truck_counts[fid] += 1
                     truck_positions[tid] = ("ferry", fid)
-                    new_state = State(truck_positions, ferry_positions, state.package_positions, state.truck_weights, ferry_truck_counts)
+                    new_state = ComponentState(truck_positions, ferry_positions, state.package_positions, state.truck_weights, ferry_truck_counts)
                     successors.append((
                         f"BOARD{{{tid},{fid}}}",
                         new_state
@@ -335,7 +346,7 @@ class LogisticsProblem(search.Problem):
                 elif tpos[0] == "ferry" and tpos[1] == fid:
                     ferry_truck_counts[fid] -= 1
                     truck_positions[tid] = ("land", fpos)
-                    new_state = State(truck_positions, ferry_positions, state.package_positions, state.truck_weights, ferry_truck_counts)
+                    new_state = ComponentState(truck_positions, ferry_positions, state.package_positions, state.truck_weights, ferry_truck_counts)
                     successors.append((
                         f"DISEMBARK{{{tid},{fid}}}",
                         new_state
@@ -355,11 +366,8 @@ class LogisticsProblem(search.Problem):
 
         return True
 
-    def h_astar(self, node):
-        """ This is the heuristic. It gets a node (not a state)
-        and returns a goal distance estimate"""
+    def h(self, state):
 
-        state = node.state
         return self.calculate_handeling_costs(state) + max(self.max_min_travel_distance(state),
                                                            self.average_reduction_heuristic(state),
                                                            self.combined_truck_ferry_distances_heuristic(state))
@@ -387,11 +395,14 @@ class LogisticsProblem(search.Problem):
                     total_truck_distances += self.min_truck_distances[destination][(fpos, False)]
                     total_ferry_distances += self.min_ferry_distances[destination][(fpos, False)]
 
-        min_truck_cost = (total_truck_distances + self.max_truck_packages - 1) // self.max_truck_packages
+        if self.max_truck_packages == 0:
+            min_truck_cost = 0 if total_truck_distances == 0 else INF
+        else:
+            min_truck_cost = (total_truck_distances + self.max_truck_packages - 1) // self.max_truck_packages
 
         ferry_edges = total_ferry_distances // 3
         if ferry_edges == 0 or self.max_ferry_packages == 0:
-            min_ferry_cost = 0 if ferry_edges == 0 else float("inf")
+            min_ferry_cost = 0 if ferry_edges == 0 else INF
         else:
             min_ferry_cost = 3 * ((ferry_edges + self.max_ferry_packages - 1)
                                 // self.max_ferry_packages)
@@ -416,10 +427,9 @@ class LogisticsProblem(search.Problem):
                     fid = tpos[1]
                     fpos = ferry_positions[fid]
                     total_distances += self.onecost_distances[destination][(fpos, True, fid)]
-        return (
-            3 * total_distances
-            + self.package_transportation_constant - 1
-        ) // self.package_transportation_constant
+        if self.package_transportation_constant == 0:
+            return 0 if total_distances == 0 else INF
+        return (3 * total_distances + self.package_transportation_constant - 1) // self.package_transportation_constant
 
     def calculate_handeling_costs(self, state):
         package_positions = state.package_positions
@@ -442,18 +452,17 @@ class LogisticsProblem(search.Problem):
                     continue
                 location = pos[1]
                 dist = self.distances[self.package_destinations[id]][(location, False)]
-                min_truck_dist = float("inf")
+                min_truck_dist = INF
 
-                for tid in truck_positions:
-                    if self.truck_capacities[tid] >= self.package_weights[id]:
-                        tpos = truck_positions[tid]
-                        if tpos[0] == "land":
-                            truck_dist = self.distances[location][(tpos[1], False)]
-                        elif tpos[0] == "ferry":
-                            fid = tpos[1]
-                            fpos = ferry_positions[fid]
-                            truck_dist = self.distances[location][(fpos, True, fid)]
-                        min_truck_dist = min(min_truck_dist, truck_dist)
+                for tid in self.capable_trucks[id]:
+                    tpos = truck_positions[tid]
+                    if tpos[0] == "land":
+                        truck_dist = self.distances[location][(tpos[1], False)]
+                    elif tpos[0] == "ferry":
+                        fid = tpos[1]
+                        fpos = ferry_positions[fid]
+                        truck_dist = self.distances[location][(fpos, True, fid)]
+                    min_truck_dist = min(min_truck_dist, truck_dist)
 
                 dist += min_truck_dist
 
@@ -471,6 +480,156 @@ class LogisticsProblem(search.Problem):
             max_travel_distance = max(max_travel_distance, dist)
 
         return max_travel_distance
+
+class LogisticsProblem(search.Problem):
+    """This class implements a logistics problem"""
+
+    def __init__(self, initial):
+
+        self.location_count = initial["Locations"]
+        self.roads = initial["Roads"]
+        self.ports = initial["Ports"]
+
+        # ---------- 1. union-find over locations ----------
+        parent = list(range(self.location_count))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]   # path halving
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        for a, b in self.roads:
+            union(a, b)
+
+        for _, (loc, served, _cap) in initial["Ferries"].items():
+            served_list = list(served)
+            if not served_list:
+                continue
+            first = served_list[0]
+            for p in served_list[1:]:
+                union(first, p)
+
+        self.loc_component = {l: find(l) for l in range(self.location_count)}
+
+        # ---------- 2. slice domain data by component ----------
+        comp_locs      = {}
+        comp_trucks    = {}
+        comp_ferries   = {}
+        comp_packages  = {}
+        comp_ports     = {}
+
+        for l in range(self.location_count):
+            comp_locs.setdefault(self.loc_component[l], set()).add(l)
+
+        for tid, (loc, cap) in initial["Trucks"].items():
+            comp_trucks.setdefault(self.loc_component[loc], {})[tid] = (loc, cap)
+
+        for fid, (loc, served, cap) in initial["Ferries"].items():
+            comp_ferries.setdefault(self.loc_component[loc], {})[fid] = (loc, served, cap)
+
+        for pid, (start, w, dest) in initial["Packages"].items():
+            comp_packages.setdefault(self.loc_component[start], {})[pid] = (start, w, dest)
+
+        for p in self.ports:
+            comp_ports.setdefault(self.loc_component[p], set()).add(p)
+
+        # ---------- 3. sanity: solvability wrt components ----------
+        # If a package's destination is in a different component than its
+        # start, no sequence of actions can deliver it.
+        for pid, (start, _w, dest) in initial["Packages"].items():
+            if self.loc_component[start] != self.loc_component[dest]:
+                raise ValueError(
+                    f"unsolvable: package {pid} spans components "
+                    f"{self.loc_component[start]} and {self.loc_component[dest]}"
+                )
+
+        # ---------- 4. keep only components with actual work ----------
+        # A component whose every package already starts at its destination
+        # (or which has no packages) contributes h=0 forever; skip it.
+        active = []
+        for c, pkgs in comp_packages.items():
+            if any(start != dest for (start, _w, dest) in pkgs.values()):
+                active.append(c)
+        active.sort()                     # deterministic order
+
+        # ---------- 5. build solvers ----------
+        self.solvers = []
+        for idx, c in enumerate(active):
+            solver = ComponentSolver(
+                idx,
+                comp_locs[c],
+                comp_trucks.get(c, {}),
+                comp_ferries.get(c, {}),
+                comp_packages.get(c, {}),
+                self.roads,
+                comp_ports.get(c, set()),
+            )
+            self.solvers.append(solver)
+
+        # ---------- 6. initial State + h cache ----------
+        initial_components = tuple(s.initial_component_state for s in self.solvers)
+        self._h_cache = {}
+        search.Problem.__init__(self, State(initial_components))
+
+
+    def path_cost(self, c, state1, action, state2):
+        """ Do not change this. Returns the cost of reaching state2 from state1 via action,
+        given cost c to reach state1: SAIL costs 3, every other action costs 1"""
+        return c + (3 if action.startswith("SAIL") else 1)
+
+    def successor(self, state):
+        """ Generates the successor states returns [(action, achieved_states, ...)]"""
+        idx = self._active_index(state)
+        if idx is None:
+            return []
+        solver = self.solvers[idx]
+        comp = state.components[idx]
+        comps = list(state.components)
+        out = []
+        for action, new_comp in solver.successor(comp):
+            comps[idx] = new_comp
+            out.append((action, State(tuple(comps))))
+            comps[idx] = comp
+        return out
+
+
+    def _active_index(self, state):
+        for i, solver in enumerate(self.solvers):
+            if not solver.goal_test(state.components[i]):
+                return i
+        return None
+
+    def goal_test(self, state):
+        return self._active_index(state) is None
+
+    def h_astar(self, node):
+        """ This is the heuristic. It gets a node (not a state)
+        and returns a goal distance estimate"""
+
+        state = node.state
+        cached = self._h_cache.get(state)
+        if cached is not None:
+            return cached
+        idx = self._active_index(state)
+        if idx is None:
+            return 0
+        total = 0
+        for i, solver in enumerate(self.solvers):
+            if i < idx:
+                continue
+            elif i == idx:
+                total += solver.h(state.components[i])
+            else:
+                total += solver.initial_h
+        self._h_cache[state] = total
+        return total
+
 
 def create_logistics_problem(game):
     print("<<create_logistics_problem")
